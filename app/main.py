@@ -4,6 +4,7 @@ import hmac
 import logging
 import time
 import re
+import socket
 from typing import Annotated
 
 import pyodbc
