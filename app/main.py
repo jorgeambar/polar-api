@@ -365,3 +365,72 @@ def db_check():
                 logger.warning(
                     "CONNECT | Falha ao fechar conexão"
                 )
+
+
+@app.get(
+    "/v1/tcp-check",
+    dependencies=[Depends(require_api_token)],
+)
+def tcp_check():
+    host = "45.6.154.46"
+    port = 1819
+    timeout = 5
+
+    start = time.monotonic()
+
+    logger.info(
+        "TCP_CHECK | Iniciando | port=%s",
+        port,
+    )
+
+    try:
+        with socket.create_connection(
+            (host, port),
+            timeout=timeout,
+        ):
+            elapsed = time.monotonic() - start
+
+            logger.info(
+                "TCP_CHECK | SUCESSO | "
+                "port=%s | elapsed=%.3fs",
+                port,
+                elapsed,
+            )
+
+            return {
+                "tcp": "connected",
+                "port": port,
+                "elapsed_seconds": round(elapsed, 3),
+            }
+
+    except socket.timeout:
+        logger.error(
+            "TCP_CHECK | TIMEOUT | port=%s",
+            port,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "tcp": "unavailable",
+                "category": "timeout",
+            },
+        )
+
+    except OSError as e:
+        # Registrar classe, não detalhes potencialmente internos
+        logger.error(
+            "TCP_CHECK | FALHA | "
+            "error_type=%s",
+            type(e).__name__,
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "tcp": "unavailable",
+                "category": "connection_error",
+                "error_type": type(e).__name__,
+            },
+        )
+
