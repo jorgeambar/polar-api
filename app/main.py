@@ -9,15 +9,26 @@ from fastapi import FastAPI, Depends, Header, HTTPException
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# ==========================================
+# LOGGING
+# ==========================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
 logger = logging.getLogger("polar-api")
+
+# ==========================================
+# FASTAPI
+# ==========================================
 
 app = FastAPI(
     title="Polar API",
     version="0.1.0",
-    description="Teste de conectividade com SQL Server"
+    description="Teste de conectividade com SQL Server",
 )
-
 
 # ==========================================
 # AUTENTICAÇÃO
@@ -29,9 +40,10 @@ def require_api_token(
     expected = os.getenv("POLAR_API_TOKEN", "")
 
     if not expected:
+        logger.error("POLAR_API_TOKEN is not configured")
         raise HTTPException(
             status_code=503,
-            detail="API token not configured"
+            detail="API token not configured",
         )
 
     scheme, _, token = (authorization or "").partition(" ")
@@ -40,11 +52,11 @@ def require_api_token(
         scheme.lower() != "bearer"
         or not hmac.compare_digest(token, expected)
     ):
+        logger.warning("API authentication failed")
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized"
+            detail="Unauthorized",
         )
-
 
 # ==========================================
 # CONEXÃO SQL SERVER
@@ -55,7 +67,7 @@ def get_connection():
         "SQL_SERVER",
         "SQL_DATABASE",
         "SQL_USERNAME",
-        "SQL_PASSWORD"
+        "SQL_PASSWORD",
     ]
 
     missing = [
@@ -70,7 +82,7 @@ def get_connection():
 
     driver = os.getenv(
         "SQL_DRIVER",
-        "ODBC Driver 18 for SQL Server"
+        "ODBC Driver 18 for SQL Server",
     )
 
     conn_str = (
@@ -81,65 +93,114 @@ def get_connection():
         f"PWD={os.environ['SQL_PASSWORD']};"
         f"Encrypt=yes;"
         f"TrustServerCertificate=no;"
-        f"Connection Timeout=8;"
+        f"Connection Timeout=5;"
     )
 
     return pyodbc.connect(
         conn_str,
-        timeout=8
+        timeout=5,
     )
 
-
 # ==========================================
-# ROTAS
+# ROTAS PÚBLICAS
 # ==========================================
 
 @app.get("/")
 def root():
     return {
         "service": "Polar API",
-        "status": "ok"
+        "status": "ok",
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    return {
+        "status": "ok",
+    }
 
 # ==========================================
-# TESTE DE ACESSO AO SQL SERVER
+# TESTE DE CONEXÃO COM SQL SERVER
 # ==========================================
 
 @app.get(
     "/v1/db-check",
-    dependencies=[Depends(require_api_token)]
+    dependencies=[Depends(require_api_token)],
 )
 def db_check():
+    conn = None
 
     try:
-        with get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            result = cursor.fetchone()
+        # Abre a conexão
+        conn = get_connection()
+
+        # Timeout da execução da consulta (segundos)
+        cursor = conn.cursor()
+        cursor.timeout = 3
+
+        # Consulta mínima: não acessa tabelas nem views
+        cursor.execute("SELECT 1 AS ok")
+
+        result = cursor.fetchone()
+
+        if result is None:
+            logger.error("DB check returned no rows")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "database": "unavailable",
+                    "category": "empty_result",
+                },
+            )
+
+        logger.info("DB check successful")
 
         return {
             "api": "ok",
             "database": "connected",
-            "query_test": result[0]
+            "query_test": result[0],
         }
 
+    except HTTPException:
+        raise
+
     except RuntimeError as e:
-        # Erro de configuração, sem expor credenciais
+        # Configuração ausente
         logger.error("SQL configuration error: %s", e)
 
         raise HTTPException(
             status_code=503,
-            detail=str(e)
+            detail={
+                "database": "unavailable",
+                "category": "configuration_error",
+            },
         )
 
     except pyodbc.Error as e:
-        # Diagnóstico sanitizado para os logs
+        # Diagnóstico sanitizado
+        args = e.args
+
+        sqlstate = (
+            str(args[0])
+            if args and len(str(args[0])) == 5
+            else "unknown"
+        )
+
+        native_code = "unknown"
+
+        # Mensagens ODBC geralmente incluem:
+        # ('08001', '[08001] ... (10060) ...')
+        if len(args) > 1:
+            import re
+
+            match = re.search(
+                r"\((-?\d+)\)",
+                str(args[1]),
+            )
+
+            if match:
+                native_code = match.group(1)
+
         error_text = str(e).lower()
 
         if (
@@ -148,44 +209,60 @@ def db_check():
         ):
             category = "authentication_failed"
 
-        elif (
-            "certificate" in error_text
-            or "ssl" in error_text
-            or "tls" in error_text
-        ):
+        elif any(x in error_text for x in [
+            "certificate",
+            "ssl",
+            "tls",
+        ]):
             category = "tls_error"
 
-        elif (
-            "timeout" in error_text
-            or "timed out" in error_text
-            or "08001" in error_text
-            or "10060" in error_text
-            or "10061" in error_text
-        ):
+        elif any(x in error_text for x in [
+            "timeout",
+            "timed out",
+            "08001",
+            "08004",
+            "08s01",
+            "10060",
+            "10061",
+            "11001",
+            "11004",
+        ]):
             category = "network_or_timeout"
 
         else:
             category = "sql_connection_error"
 
-        # Não registrar a mensagem completa: pode conter
-        # informações internas do ambiente.
         logger.warning(
-            "SQL connection test failed: category=%s",
-            category
+            "SQL check failed | category=%s | sqlstate=%s | native_code=%s",
+            category,
+            sqlstate,
+            native_code,
         )
 
         raise HTTPException(
             status_code=503,
             detail={
                 "database": "unavailable",
-                "category": category
-            }
+                "category": category,
+                "sqlstate": sqlstate,
+                "native_code": native_code,
+            },
         )
 
     except Exception:
-        logger.exception("Unexpected database test error")
+        logger.exception("Unexpected DB check error")
 
         raise HTTPException(
             status_code=500,
-            detail="Unexpected internal error"
+            detail={
+                "database": "unavailable",
+                "category": "internal_error",
+            },
         )
+
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.warning("Failed to close SQL connection")
