@@ -368,6 +368,7 @@ def db_check():
                 )
 
 
+
 @app.get(
     "/v1/tcp-check",
     dependencies=[Depends(require_api_token)],
@@ -375,13 +376,28 @@ def db_check():
 def tcp_check():
     host = "45.6.154.46"
     port = 1819
-    timeout = 5
+    timeout = 10
 
     start = time.monotonic()
 
+    # Descobre o IP público de saída do serviço Render.
+    # Requer acesso HTTPS a um serviço externo.
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            "https://api.ipify.org",
+            timeout=5,
+        ) as response:
+            outbound_ip = response.read().decode().strip()
+    except Exception:
+        outbound_ip = "unavailable"
+
     logger.info(
-        "TCP_CHECK | Iniciando | port=%s",
+        "TCP_CHECK | target=%s:%s | outbound_ip=%s",
+        host,
         port,
+        outbound_ip,
     )
 
     try:
@@ -392,46 +408,40 @@ def tcp_check():
             elapsed = time.monotonic() - start
 
             logger.info(
-                "TCP_CHECK | SUCESSO | "
-                "port=%s | elapsed=%.3fs",
-                port,
+                "TCP_CHECK | SUCCESS | elapsed=%.3fs",
                 elapsed,
             )
 
             return {
                 "tcp": "connected",
-                "port": port,
+                "target": f"{host}:{port}",
+                "outbound_ip": outbound_ip,
                 "elapsed_seconds": round(elapsed, 3),
             }
 
-    except socket.timeout:
-        logger.error(
-            "TCP_CHECK | TIMEOUT | port=%s",
-            port,
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "tcp": "unavailable",
-                "category": "timeout",
-            },
-        )
-
     except OSError as e:
-        # Registrar classe, não detalhes potencialmente internos
+        elapsed = time.monotonic() - start
+
         logger.error(
-            "TCP_CHECK | FALHA | "
-            "error_type=%s",
+            "TCP_CHECK | FAILED | type=%s | "
+            "errno=%s | elapsed=%.3fs",
             type(e).__name__,
+            e.errno,
+            elapsed,
         )
 
         raise HTTPException(
             status_code=503,
             detail={
                 "tcp": "unavailable",
-                "category": "connection_error",
+                "category": (
+                    "timeout"
+                    if isinstance(e, socket.timeout)
+                    else "connection_error"
+                ),
                 "error_type": type(e).__name__,
+                "errno": e.errno,
+                "target": f"{host}:{port}",
+                "outbound_ip": outbound_ip,
             },
         )
-
