@@ -38,7 +38,7 @@ logger = logging.getLogger("polar-api")
 
 app = FastAPI(
     title="Polar API",
-    version="0.2.0",
+    version="0.2.1",
     description="Diagnóstico de conectividade com SQL Server",
 )
 
@@ -140,7 +140,7 @@ def build_connection_string(config):
         f"PWD={odbc_value(config['password'])};"
         f"Encrypt={config['encrypt']};"
         f"TrustServerCertificate={config['trust_certificate']};"
-        f"Connection Timeout=8;"
+        f"Connection Timeout=10;"
     )
 
 
@@ -245,8 +245,12 @@ def get_connection():
 
         conn = pyodbc.connect(
             build_connection_string(config),
-            timeout=8,
+            timeout=10,
         )
+
+        # Timeout de execução das consultas SQL (segundos).
+        # Configurado na conexão, não no cursor.
+        conn.timeout = 15
 
         elapsed = time.monotonic() - start
 
@@ -304,6 +308,30 @@ def close_resources(conn=None, cursor=None):
 
 
 # ==========================================
+# AUXILIAR - ERRO INTERNO
+# ==========================================
+
+def internal_error_response(stage, error):
+
+    logger.exception(
+        "INTERNAL | Erro inesperado | "
+        "stage=%s | error_type=%s",
+        stage,
+        type(error).__name__,
+    )
+
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "stage": stage,
+            "status": "failed",
+            "category": "internal_error",
+            "error_type": type(error).__name__,
+        },
+    )
+
+
+# ==========================================
 # ROTAS PÚBLICAS
 # ==========================================
 
@@ -312,7 +340,7 @@ def root():
 
     return {
         "service": "Polar API",
-        "version": "0.2.0",
+        "version": "0.2.1",
         "status": "ok",
     }
 
@@ -375,6 +403,7 @@ def tcp_check():
             (host, port),
             timeout=10,
         ):
+
             elapsed = time.monotonic() - start
 
             logger.info(
@@ -452,6 +481,7 @@ def db_check():
                 status_code=503,
                 detail={
                     "stage": stage,
+                    "status": "failed",
                     "category": "driver_not_installed",
                     "requested_driver": config["driver"],
                     "installed_drivers": drivers,
@@ -478,9 +508,10 @@ def db_check():
         query_start = time.monotonic()
 
         cursor = conn.cursor()
-        cursor.timeout = 10
 
-        cursor.execute("SELECT 1 AS connection_test")
+        cursor.execute(
+            "SELECT 1 AS connection_test"
+        )
 
         result = cursor.fetchone()
 
@@ -579,13 +610,14 @@ def db_check():
                 "status": "failed",
                 "category": "internal_error",
                 "error_type": type(e).__name__,
-                "error_message": str(e)[:500],
             },
         )
 
     finally:
 
         close_resources(conn, cursor)
+
+
 # ==========================================
 # ETAPA 3 - TESTE REAL DA VIEW
 # ==========================================
@@ -635,7 +667,6 @@ def test_invoice():
         query_start = time.monotonic()
 
         cursor = conn.cursor()
-        cursor.timeout = 15
 
         cursor.execute(query)
 
@@ -728,9 +759,10 @@ def test_invoice():
 
         logger.exception(
             "TEST | Erro inesperado | "
-            "stage=%s | error_type=%s",
+            "stage=%s | error_type=%s | message=%s",
             stage,
             type(e).__name__,
+            str(e),
         )
 
         raise HTTPException(
