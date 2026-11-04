@@ -445,3 +445,182 @@ def tcp_check():
                 "outbound_ip": outbound_ip,
             },
         )
+
+
+
+# ==========================================
+# TESTE REAL - VIEW PROTHEUS
+# ==========================================
+
+@app.get(
+    "/v1/test",
+    dependencies=[Depends(require_api_token)],
+)
+def test_invoice():
+    conn = None
+    cursor = None
+
+    start = time.monotonic()
+    stage = "initialization"
+
+    logger.info("TEST | Início do teste da VIEW_PROTHEUS_GERENCIAL_VENDAS")
+
+    try:
+        # ETAPA 1: Conexão
+        stage = "connection"
+
+        logger.info("TEST | ETAPA 1 | Conectando ao SQL Server")
+
+        conn = get_connection()
+
+        logger.info("TEST | ETAPA 1 | Conexão estabelecida")
+
+        # ETAPA 2: Preparação da consulta
+        stage = "query_execution"
+
+        query = """
+            SELECT TOP 1 *
+            FROM VIEW_PROTHEUS_GERENCIAL_VENDAS
+            WHERE FILIAL = 'POLAR'
+            ORDER BY
+                DataEmissao DESC,
+                NotaFiscal DESC,
+                N_Item ASC
+        """
+
+        logger.info(
+            "TEST | ETAPA 2 | Executando consulta "
+            "| view=VIEW_PROTHEUS_GERENCIAL_VENDAS "
+            "| filial=POLAR"
+        )
+
+        query_start = time.monotonic()
+
+        cursor = conn.cursor()
+        cursor.timeout = 15
+
+        cursor.execute(query)
+
+        result = cursor.fetchone()
+
+        query_elapsed = time.monotonic() - query_start
+
+        # ETAPA 3: Resultado
+        stage = "result_processing"
+
+        if result is None:
+            logger.warning(
+                "TEST | ETAPA 3 | Consulta executada, "
+                "mas nenhuma linha foi encontrada "
+                "| filial=POLAR"
+            )
+
+            return {
+                "status": "connected",
+                "database": "connected",
+                "query": "executed",
+                "records_found": 0,
+                "message": "Nenhum registro encontrado para FILIAL = POLAR",
+            }
+
+        columns = [column[0] for column in cursor.description]
+
+        first_record = dict(zip(columns, result))
+
+        # Converter valores não serializáveis em JSON
+        for key, value in first_record.items():
+            if hasattr(value, "isoformat"):
+                first_record[key] = value.isoformat()
+
+        logger.info(
+            "TEST | ETAPA 3 | Primeira linha recuperada "
+            "| columns=%s | query_elapsed=%.2fs",
+            len(columns),
+            query_elapsed,
+        )
+
+        total_elapsed = time.monotonic() - start
+
+        logger.info(
+            "TEST | SUCESSO | total_elapsed=%.2fs",
+            total_elapsed,
+        )
+
+        return {
+            "status": "success",
+            "database": "connected",
+            "view": "VIEW_PROTHEUS_GERENCIAL_VENDAS",
+            "records_found": 1,
+            "query_elapsed_seconds": round(query_elapsed, 3),
+            "total_elapsed_seconds": round(total_elapsed, 3),
+            "data": first_record,
+        }
+
+    except HTTPException:
+        raise
+
+    except pyodbc.Error as e:
+        args = e.args
+
+        sqlstate = (
+            str(args[0])
+            if args and len(str(args[0])) == 5
+            else "unknown"
+        )
+
+        native_codes = re.findall(
+            r"\((-?\d+)\)",
+            str(args[1]) if len(args) > 1 else "",
+        )
+
+        logger.exception(
+            "TEST | ERRO SQL/ODBC "
+            "| stage=%s | sqlstate=%s | native_codes=%s",
+            stage,
+            sqlstate,
+            native_codes or ["unknown"],
+        )
+
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "failed",
+                "stage": stage,
+                "category": "sql_error",
+                "sqlstate": sqlstate,
+                "native_codes": native_codes or ["unknown"],
+            },
+        )
+
+    except Exception as e:
+        logger.exception(
+            "TEST | ERRO INESPERADO "
+            "| stage=%s | error_type=%s",
+            stage,
+            type(e).__name__,
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "failed",
+                "stage": stage,
+                "category": "internal_error",
+                "error_type": type(e).__name__,
+            },
+        )
+
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                logger.warning("TEST | Falha ao fechar cursor")
+
+        if conn is not None:
+            try:
+                conn.close()
+                logger.info("TEST | Conexão encerrada")
+            except Exception:
+                logger.warning("TEST | Falha ao encerrar conexão")
+
