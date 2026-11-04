@@ -1,3 +1,4 @@
+
 import os
 import hmac
 import logging
@@ -38,7 +39,7 @@ logger = logging.getLogger("polar-api")
 
 app = FastAPI(
     title="Polar API",
-    version="0.2.1",
+    version="0.3.0",
     description="Diagnóstico de conectividade com SQL Server",
 )
 
@@ -60,9 +61,7 @@ def require_api_token(
             detail="API token not configured",
         )
 
-    scheme, _, token = (
-        (authorization or "").partition(" ")
-    )
+    scheme, _, token = (authorization or "").partition(" ")
 
     if (
         scheme.lower() != "bearer"
@@ -96,8 +95,7 @@ def get_sql_config():
 
     if missing:
         raise RuntimeError(
-            "Missing configuration: "
-            + ", ".join(missing)
+            "Missing configuration: " + ", ".join(missing)
         )
 
     return {
@@ -114,17 +112,23 @@ def get_sql_config():
             "SQL_TRUST_SERVER_CERTIFICATE",
             "no",
         ),
+        "connection_timeout": int(
+            os.getenv("SQL_CONNECTION_TIMEOUT", "15")
+        ),
+        "query_timeout": int(
+            os.getenv("SQL_QUERY_TIMEOUT", "30")
+        ),
     }
 
 
 # ==========================================
-# CONSTRUÇÃO DA CONNECTION STRING
+# CONNECTION STRING
 # ==========================================
 
 def odbc_value(value: str) -> str:
     """
-    Protege valores que contenham caracteres
-    especiais na connection string ODBC.
+    Protege valores com caracteres especiais
+    na connection string ODBC.
     """
 
     return "{" + str(value).replace("}", "}}") + "}"
@@ -140,12 +144,12 @@ def build_connection_string(config):
         f"PWD={odbc_value(config['password'])};"
         f"Encrypt={config['encrypt']};"
         f"TrustServerCertificate={config['trust_certificate']};"
-        f"Connection Timeout=10;"
+        f"Connection Timeout={config['connection_timeout']};"
     )
 
 
 # ==========================================
-# DIAGNÓSTICO DE ERROS ODBC
+# DIAGNÓSTICO ODBC
 # ==========================================
 
 def get_odbc_error_details(error):
@@ -164,7 +168,7 @@ def get_odbc_error_details(error):
         else str(error)
     )
 
-    # Proteção de informações sensíveis
+    # Oculta possíveis credenciais presentes na mensagem.
     error_message = re.sub(
         r"(?i)(PWD|PASSWORD)\s*=\s*[^;}\s]+",
         r"\1=***",
@@ -179,7 +183,7 @@ def get_odbc_error_details(error):
     return {
         "sqlstate": sqlstate,
         "native_codes": native_codes or ["unknown"],
-        "error_message": error_message[:1500],
+        "error_message": error_message[:2000],
     }
 
 
@@ -202,22 +206,44 @@ def classify_odbc_error(details):
     ]):
         return "tls_error"
 
+    if sqlstate in ["HYT00", "HYT01"]:
+        return "connection_or_query_timeout"
+
     if sqlstate in [
-        "HYT00",
-        "HYT01",
         "08001",
         "08004",
         "08S01",
     ]:
-        return "network_or_timeout"
+        return "network_or_connection_error"
 
     if any(term in message for term in [
         "timeout",
         "timed out",
     ]):
-        return "network_or_timeout"
+        return "connection_or_query_timeout"
 
-    return "sql_connection_error"
+    return "sql_error"
+
+
+def log_odbc_error(prefix, stage, error):
+
+    details = get_odbc_error_details(error)
+    category = classify_odbc_error(details)
+
+    logger.error(
+        "%s | FALHA ODBC | "
+        "stage=%s | category=%s | "
+        "sqlstate=%s | native_codes=%s | "
+        "message=%s",
+        prefix,
+        stage,
+        category,
+        details["sqlstate"],
+        details["native_codes"],
+        details["error_message"],
+    )
+
+    return details, category
 
 
 # ==========================================
@@ -233,24 +259,26 @@ def get_connection():
     logger.info(
         "CONNECT | Iniciando conexão | "
         "server=%s | database=%s | driver=%s | "
-        "encrypt=%s | trust_certificate=%s",
+        "encrypt=%s | trust_certificate=%s | "
+        "timeout=%ss",
         config["server"],
         config["database"],
         config["driver"],
         config["encrypt"],
         config["trust_certificate"],
+        config["connection_timeout"],
     )
 
     try:
 
         conn = pyodbc.connect(
             build_connection_string(config),
-            timeout=10,
+            timeout=config["connection_timeout"],
         )
 
-        # Timeout de execução das consultas SQL (segundos).
-        # Configurado na conexão, não no cursor.
-        conn.timeout = 15
+        # Timeout de execução das consultas.
+        # É configurado na conexão, não no cursor.
+        conn.timeout = config["query_timeout"]
 
         elapsed = time.monotonic() - start
 
@@ -264,13 +292,17 @@ def get_connection():
     except pyodbc.Error as e:
 
         elapsed = time.monotonic() - start
+
         details = get_odbc_error_details(e)
+        category = classify_odbc_error(details)
 
         logger.error(
             "CONNECT | FALHA | "
-            "elapsed=%.2fs | sqlstate=%s | "
-            "native_codes=%s | error_message=%s",
+            "elapsed=%.2fs | category=%s | "
+            "sqlstate=%s | native_codes=%s | "
+            "message=%s",
             elapsed,
+            category,
             details["sqlstate"],
             details["native_codes"],
             details["error_message"],
@@ -281,14 +313,14 @@ def get_connection():
     except Exception:
 
         logger.exception(
-            "CONNECT | Erro inesperado ao preparar conexão"
+            "CONNECT | ERRO INESPERADO"
         )
 
         raise
 
 
 # ==========================================
-# AUXILIAR - FECHAMENTO
+# FECHAMENTO DE RECURSOS
 # ==========================================
 
 def close_resources(conn=None, cursor=None):
@@ -297,36 +329,36 @@ def close_resources(conn=None, cursor=None):
         try:
             cursor.close()
         except Exception:
-            logger.warning("DB | Falha ao fechar cursor")
+            logger.exception("DB | Erro ao fechar cursor")
 
     if conn is not None:
         try:
             conn.close()
             logger.info("DB | Conexão encerrada")
         except Exception:
-            logger.warning("DB | Falha ao fechar conexão")
+            logger.exception("DB | Erro ao fechar conexão")
 
 
 # ==========================================
-# AUXILIAR - ERRO INTERNO
+# RESPOSTA PADRÃO PARA ERRO ODBC
 # ==========================================
 
-def internal_error_response(stage, error):
+def raise_odbc_http_error(stage, error, prefix):
 
-    logger.exception(
-        "INTERNAL | Erro inesperado | "
-        "stage=%s | error_type=%s",
+    details, category = log_odbc_error(
+        prefix,
         stage,
-        type(error).__name__,
+        error,
     )
 
     raise HTTPException(
-        status_code=500,
+        status_code=503,
         detail={
             "stage": stage,
             "status": "failed",
-            "category": "internal_error",
-            "error_type": type(error).__name__,
+            "category": category,
+            "sqlstate": details["sqlstate"],
+            "native_codes": details["native_codes"],
         },
     )
 
@@ -340,7 +372,7 @@ def root():
 
     return {
         "service": "Polar API",
-        "version": "0.2.1",
+        "version": "0.3.0",
         "status": "ok",
     }
 
@@ -364,30 +396,22 @@ def health():
 def tcp_check():
 
     stage = "configuration"
-
     start = time.monotonic()
 
     try:
 
         config = get_sql_config()
 
-        server = config["server"]
-
-        # Remove prefixo TCP quando existir
         server = re.sub(
             r"(?i)^tcp:",
             "",
-            server,
+            config["server"],
         )
 
-        # Extrai host e porta
         if "," in server:
-
             host, port = server.rsplit(",", 1)
             port = int(port)
-
         else:
-
             host = server
             port = 1433
 
@@ -403,7 +427,6 @@ def tcp_check():
             (host, port),
             timeout=10,
         ):
-
             elapsed = time.monotonic() - start
 
             logger.info(
@@ -422,9 +445,10 @@ def tcp_check():
     except Exception as e:
 
         logger.exception(
-            "TCP | FALHA | stage=%s | error_type=%s",
+            "TCP | FALHA | stage=%s | error_type=%s | message=%s",
             stage,
             type(e).__name__,
+            str(e),
         )
 
         raise HTTPException(
@@ -439,7 +463,7 @@ def tcp_check():
 
 
 # ==========================================
-# ETAPA 2 - CONEXÃO REAL SQL SERVER
+# ETAPA 2 - CONEXÃO E CONSULTA SIMPLES
 # ==========================================
 
 @app.get(
@@ -462,7 +486,6 @@ def db_check():
         stage = "driver_check"
 
         drivers = pyodbc.drivers()
-
         config = get_sql_config()
 
         logger.info(
@@ -498,7 +521,7 @@ def db_check():
 
         conn = get_connection()
 
-        # ETAPA 3: consulta simples
+        # ETAPA 3: SELECT 1
         stage = "query_execution"
 
         logger.info(
@@ -518,7 +541,6 @@ def db_check():
         query_elapsed = time.monotonic() - query_start
 
         if result is None:
-
             raise RuntimeError(
                 "SELECT 1 não retornou resultado"
             )
@@ -551,7 +573,7 @@ def db_check():
     except RuntimeError:
 
         logger.exception(
-            "DB_CHECK | Falha interna | stage=%s",
+            "DB_CHECK | ERRO DE CONFIGURAÇÃO OU EXECUÇÃO | stage=%s",
             stage,
         )
 
@@ -566,31 +588,10 @@ def db_check():
 
     except pyodbc.Error as e:
 
-        details = get_odbc_error_details(e)
-
-        category = classify_odbc_error(details)
-
-        logger.error(
-            "DB_CHECK | FALHA ODBC | "
-            "stage=%s | category=%s | "
-            "sqlstate=%s | native_codes=%s | "
-            "message=%s",
+        raise_odbc_http_error(
             stage,
-            category,
-            details["sqlstate"],
-            details["native_codes"],
-            details["error_message"],
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "stage": stage,
-                "status": "failed",
-                "category": category,
-                "sqlstate": details["sqlstate"],
-                "native_codes": details["native_codes"],
-            },
+            e,
+            "DB_CHECK",
         )
 
     except Exception as e:
@@ -688,7 +689,9 @@ def test_invoice():
                 "status": "success",
                 "view": "VIEW_PROTHEUS_GERENCIAL_VENDAS",
                 "records_found": 0,
-                "message": "Nenhum registro encontrado para FILIAL = POLAR",
+                "message": (
+                    "Nenhum registro encontrado para FILIAL = POLAR"
+                ),
             }
 
         columns = [
@@ -726,22 +729,11 @@ def test_invoice():
     except HTTPException:
         raise
 
-    except pyodbc.Error as e:
+    except RuntimeError:
 
-        details = get_odbc_error_details(e)
-
-        category = classify_odbc_error(details)
-
-        logger.error(
-            "TEST | FALHA ODBC | "
-            "stage=%s | category=%s | "
-            "sqlstate=%s | native_codes=%s | "
-            "message=%s",
+        logger.exception(
+            "TEST | ERRO DE CONFIGURAÇÃO | stage=%s",
             stage,
-            category,
-            details["sqlstate"],
-            details["native_codes"],
-            details["error_message"],
         )
 
         raise HTTPException(
@@ -749,16 +741,22 @@ def test_invoice():
             detail={
                 "stage": stage,
                 "status": "failed",
-                "category": category,
-                "sqlstate": details["sqlstate"],
-                "native_codes": details["native_codes"],
+                "category": "configuration_error",
             },
+        )
+
+    except pyodbc.Error as e:
+
+        raise_odbc_http_error(
+            stage,
+            e,
+            "TEST",
         )
 
     except Exception as e:
 
         logger.exception(
-            "TEST | Erro inesperado | "
+            "TEST | ERRO INESPERADO | "
             "stage=%s | error_type=%s | message=%s",
             stage,
             type(e).__name__,
