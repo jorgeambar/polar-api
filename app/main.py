@@ -562,32 +562,30 @@ def db_check():
             },
         )
 
-  except Exception as e:
+    except Exception as e:
 
-    logger.exception(
-        "DB_CHECK | ERRO INESPERADO | "
-        "stage=%s | error_type=%s | message=%s",
-        stage,
-        type(e).__name__,
-        str(e),
-    )
+        logger.exception(
+            "DB_CHECK | ERRO INESPERADO | "
+            "stage=%s | error_type=%s | message=%s",
+            stage,
+            type(e).__name__,
+            str(e),
+        )
 
-    raise HTTPException(
-        status_code=500,
-        detail={
-            "stage": stage,
-            "status": "failed",
-            "category": "internal_error",
-            "error_type": type(e).__name__,
-            "error_message": str(e)[:500],
-        },
-    )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "stage": stage,
+                "status": "failed",
+                "category": "internal_error",
+                "error_type": type(e).__name__,
+                "error_message": str(e)[:500],
+            },
+        )
 
     finally:
 
         close_resources(conn, cursor)
-
-
 # ==========================================
 # ETAPA 3 - TESTE REAL DA VIEW
 # ==========================================
