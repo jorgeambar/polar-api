@@ -1,762 +1,646 @@
-import os
-import hmac
-import logging
-import time
-import re
-import socket
 
-from typing import Annotated
+import json
+import logging
+import re
+
+from datetime import date
+from decimal import Decimal
+from typing import Optional
 
 import pyodbc
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 
-load_dotenv()
+from app.database import get_connection
+from app.auth import require_api_token
 
-
-# ==========================================
-# LOGGING
-# ==========================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format=(
-        "%(asctime)s | %(levelname)s | "
-        "%(name)s | %(message)s"
-    ),
-)
 
 logger = logging.getLogger("polar-api")
 
-
-# ==========================================
-# FASTAPI
-# ==========================================
-
 app = FastAPI(
     title="Polar API",
-    version="0.4.0",
-    description="Diagnóstico e consulta SQL Server",
+    version="1.0.0",
 )
 
 
-# ==========================================
-# AUTENTICAÇÃO
-# ==========================================
+# ============================================================
+# HELPERS
+# ============================================================
 
-def require_api_token(
-    authorization: Annotated[str | None, Header()] = None
-):
-    expected = os.getenv("POLAR_API_TOKEN", "")
-
-    if not expected:
-        logger.error("AUTH | POLAR_API_TOKEN não configurado")
-        raise HTTPException(
-            status_code=503,
-            detail="API token not configured",
-        )
-
-    scheme, _, token = (authorization or "").partition(" ")
-
-    if (
-        scheme.lower() != "bearer"
-        or not hmac.compare_digest(token, expected)
-    ):
-        logger.warning("AUTH | Falha de autenticação")
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-        )
-
-
-# ==========================================
-# CONFIGURAÇÃO SQL
-# ==========================================
-
-def get_sql_config():
-
-    required_vars = [
-        "SQL_SERVER",
-        "SQL_PORT",
-        "SQL_DATABASE",
-        "SQL_USER",
-        "SQL_PASSWORD",
-    ]
-
-    missing = [
-        var for var in required_vars
-        if not os.getenv(var)
-    ]
-
-    if missing:
-        raise RuntimeError(
-            "Missing configuration: " + ", ".join(missing)
-        )
-
-    return {
-        "server": os.environ["SQL_SERVER"].strip(),
-        "port": int(os.environ["SQL_PORT"]),
-        "database": os.environ["SQL_DATABASE"].strip(),
-        "username": os.environ["SQL_USER"],
-        "password": os.environ["SQL_PASSWORD"],
-        "driver": os.getenv(
-            "SQL_DRIVER",
-            "ODBC Driver 18 for SQL Server",
-        ),
-        "encrypt": os.getenv("SQL_ENCRYPT", "no").lower(),
-        "trust_certificate": os.getenv(
-            "SQL_TRUST_SERVER_CERTIFICATE",
-            "yes",
-        ).lower(),
-        "connection_timeout": int(
-            os.getenv("SQL_CONNECTION_TIMEOUT", "15")
-        ),
-        "query_timeout": int(
-            os.getenv("SQL_QUERY_TIMEOUT", "30")
-        ),
-    }
-
-
-# ==========================================
-# CONNECTION STRING
-# ==========================================
-
-def odbc_value(value: str) -> str:
+def rows_to_dict(cursor, rows):
     """
-    Protege valores com caracteres especiais
-    na connection string ODBC.
+    Converte resultados do pyodbc para uma lista de dicionários.
     """
 
-    return "{" + str(value).replace("}", "}}") + "}"
+    columns = [
+        column[0]
+        for column in cursor.description
+    ]
+
+    return [
+        dict(zip(columns, row))
+        for row in rows
+    ]
 
 
-def build_connection_string(config):
+def serialize_data(data):
+    """
+    Prepara datas e valores numéricos para resposta JSON.
+    """
 
-    server = (
-        f"tcp:{config['server']},{config['port']}"
-    )
-
-    return (
-        f"DRIVER={odbc_value(config['driver'])};"
-        f"SERVER={server};"
-        f"DATABASE={odbc_value(config['database'])};"
-        f"UID={odbc_value(config['username'])};"
-        f"PWD={odbc_value(config['password'])};"
-        f"Encrypt={config['encrypt']};"
-        f"TrustServerCertificate={config['trust_certificate']};"
-        f"Connection Timeout={config['connection_timeout']};"
-    )
+    return jsonable_encoder(data)
 
 
-# ==========================================
-# DIAGNÓSTICO ODBC
-# ==========================================
-
-def get_odbc_error_details(error):
-
-    args = error.args
-
-    sqlstate = (
-        str(args[0])
-        if args and len(str(args[0])) == 5
-        else "unknown"
-    )
-
-    error_message = (
-        str(args[1])
-        if len(args) > 1
-        else str(error)
-    )
-
-    # Evita registrar credenciais em mensagens ODBC.
-    error_message = re.sub(
-        r"(?i)(PWD|PASSWORD)\s*=\s*[^;}\s]+",
-        r"\1=***",
-        error_message,
-    )
-
-    native_codes = re.findall(
-        r"\((-?\d+)\)",
-        error_message,
-    )
-
-    return {
-        "sqlstate": sqlstate,
-        "native_codes": native_codes or ["unknown"],
-        "error_message": error_message[:2000],
-    }
+def normalize_cnpj(value: str) -> str:
+    return re.sub(r"\D", "", value)
 
 
-def classify_odbc_error(details):
-
-    sqlstate = details["sqlstate"]
-    message = details["error_message"].lower()
-
-    if (
-        "login failed" in message
-        or "18456" in message
-    ):
-        return "authentication_failed"
-
-    if any(term in message for term in [
-        "certificate",
-        "ssl",
-        "tls",
-        "handshake",
-    ]):
-        return "tls_error"
-
-    if sqlstate in ["HYT00", "HYT01"]:
-        return "connection_or_query_timeout"
-
-    if sqlstate in ["08001", "08004", "08S01"]:
-        return "network_or_connection_error"
-
-    if any(term in message for term in [
-        "timeout",
-        "timed out",
-    ]):
-        return "connection_or_query_timeout"
-
-    return "sql_error"
+def normalize_sku(value: str) -> str:
+    return str(value).strip()
 
 
-def log_odbc_error(prefix, stage, error):
-
-    details = get_odbc_error_details(error)
-    category = classify_odbc_error(details)
-
-    logger.error(
-        "%s | FALHA ODBC | "
-        "stage=%s | category=%s | "
-        "sqlstate=%s | native_codes=%s | "
-        "message=%s",
-        prefix,
-        stage,
-        category,
-        details["sqlstate"],
-        details["native_codes"],
-        details["error_message"],
-    )
-
-    return details, category
-
-
-def raise_odbc_http_error(stage, error, prefix):
-
-    details, category = log_odbc_error(
-        prefix,
-        stage,
-        error,
-    )
-
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "stage": stage,
-            "status": "failed",
-            "category": category,
-            "sqlstate": details["sqlstate"],
-            "native_codes": details["native_codes"],
-        },
-    )
-
-
-# ==========================================
-# CONEXÃO SQL SERVER
-# ==========================================
-
-def get_connection():
-
-    config = get_sql_config()
-
-    start = time.monotonic()
-
-    logger.info(
-        "CONNECT | Iniciando conexão | "
-        "server=%s | port=%s | database=%s | "
-        "driver=%s | encrypt=%s | "
-        "trust_certificate=%s | timeout=%ss",
-        config["server"],
-        config["port"],
-        config["database"],
-        config["driver"],
-        config["encrypt"],
-        config["trust_certificate"],
-        config["connection_timeout"],
-    )
+def find_numeric_sku(value: str) -> Optional[int]:
+    """
+    Retorna o SKU numérico quando possível.
+    """
 
     try:
-
-        conn = pyodbc.connect(
-            build_connection_string(config),
-            timeout=config["connection_timeout"],
-        )
-
-        # Equivalente ao timeout de execução de consultas.
-        # Não configurar timeout no cursor.
-        conn.timeout = config["query_timeout"]
-
-        elapsed = time.monotonic() - start
-
-        logger.info(
-            "CONNECT | SUCESSO | elapsed=%.3fs",
-            elapsed,
-        )
-
-        return conn
-
-    except pyodbc.Error as e:
-
-        elapsed = time.monotonic() - start
-        details = get_odbc_error_details(e)
-        category = classify_odbc_error(details)
-
-        logger.error(
-            "CONNECT | FALHA | elapsed=%.3fs | "
-            "category=%s | sqlstate=%s | "
-            "native_codes=%s | message=%s",
-            elapsed,
-            category,
-            details["sqlstate"],
-            details["native_codes"],
-            details["error_message"],
-        )
-
-        raise
-
-    except Exception:
-
-        logger.exception(
-            "CONNECT | ERRO INESPERADO"
-        )
-
-        raise
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
-# ==========================================
-# FECHAMENTO DE RECURSOS
-# ==========================================
-
-def close_resources(conn=None, cursor=None):
-
-    if cursor is not None:
-        try:
-            cursor.close()
-        except Exception:
-            logger.exception("DB | Erro ao fechar cursor")
-
-    if conn is not None:
-        try:
-            conn.close()
-            logger.info("DB | Conexão encerrada")
-        except Exception:
-            logger.exception("DB | Erro ao fechar conexão")
-
-
-# ==========================================
-# ROTAS PÚBLICAS
-# ==========================================
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/")
 def root():
-
     return {
+        "success": True,
         "service": "Polar API",
-        "version": "0.4.0",
-        "status": "ok",
     }
 
 
 @app.get("/health")
 def health():
-
     return {
-        "status": "ok",
+        "success": True,
+        "status": "online",
     }
 
 
-# ==========================================
-# ETAPA 1 - TESTE TCP
-# ==========================================
+# ============================================================
+# INVOICE
+#
+# GET /invoice
+#
+# Parâmetros:
+#   nf
+#   cnpj
+#   dataInicio
+#   dataFim
+#   limit
+# ============================================================
 
 @app.get(
-    "/v1/tcp-check",
+    "/invoice",
     dependencies=[Depends(require_api_token)],
 )
-def tcp_check():
-
-    stage = "configuration"
-    start = time.monotonic()
-
-    try:
-
-        config = get_sql_config()
-
-        host = config["server"]
-        port = config["port"]
-
-        stage = "tcp_connection"
-
-        logger.info(
-            "TCP | Testando conexão | target=%s:%s",
-            host,
-            port,
-        )
-
-        with socket.create_connection(
-            (host, port),
-            timeout=10,
-        ):
-
-            elapsed = time.monotonic() - start
-
-            logger.info(
-                "TCP | SUCESSO | elapsed=%.3fs",
-                elapsed,
-            )
-
-            return {
-                "stage": "tcp",
-                "status": "success",
-                "host": host,
-                "port": port,
-                "elapsed_seconds": round(elapsed, 3),
-            }
-
-    except Exception as e:
-
-        logger.exception(
-            "TCP | FALHA | stage=%s | "
-            "error_type=%s | message=%s",
-            stage,
-            type(e).__name__,
-            str(e),
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "stage": "tcp",
-                "status": "failed",
-                "failed_at": stage,
-                "error_type": type(e).__name__,
-            },
-        )
-
-
-# ==========================================
-# ETAPA 2 - CONEXÃO SQL + SELECT 1
-# ==========================================
-
-@app.get(
-    "/v1/db-check",
-    dependencies=[Depends(require_api_token)],
-)
-def db_check():
-
-    conn = None
-    cursor = None
-
-    stage = "initialization"
-    start = time.monotonic()
-
-    logger.info("DB_CHECK | Início")
-
-    try:
-
-        # 1. Verificar driver
-        stage = "driver_check"
-
-        drivers = pyodbc.drivers()
-        config = get_sql_config()
-
-        logger.info(
-            "DB_CHECK | Drivers instalados: %s",
-            drivers,
-        )
-
-        if config["driver"] not in drivers:
-
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "stage": stage,
-                    "status": "failed",
-                    "category": "driver_not_installed",
-                    "requested_driver": config["driver"],
-                    "installed_drivers": drivers,
-                },
-            )
-
-        logger.info(
-            "DB_CHECK | Driver encontrado: %s",
-            config["driver"],
-        )
-
-        # 2. Conectar ao SQL Server
-        stage = "connection"
-
-        conn = get_connection()
-
-        # 3. Executar consulta simples
-        stage = "query_execution"
-
-        logger.info(
-            "DB_CHECK | Executando SELECT 1"
-        )
-
-        query_start = time.monotonic()
-
-        cursor = conn.cursor()
-
-        cursor.execute(
-            "SELECT 1 AS connection_test"
-        )
-
-        result = cursor.fetchone()
-
-        query_elapsed = time.monotonic() - query_start
-
-        if result is None:
-            raise RuntimeError(
-                "SELECT 1 não retornou resultado"
-            )
-
-        total_elapsed = time.monotonic() - start
-
-        logger.info(
-            "DB_CHECK | SUCESSO | "
-            "result=%s | query_elapsed=%.3fs | "
-            "total_elapsed=%.3fs",
-            result[0],
-            query_elapsed,
-            total_elapsed,
-        )
-
-        return {
-            "stage": "db",
-            "status": "success",
-            "driver": config["driver"],
-            "database": "connected",
-            "query": "SELECT 1",
-            "result": result[0],
-            "query_elapsed_seconds": round(query_elapsed, 3),
-            "total_elapsed_seconds": round(total_elapsed, 3),
-        }
-
-    except HTTPException:
-        raise
-
-    except pyodbc.Error as e:
-
-        raise_odbc_http_error(
-            stage,
-            e,
-            "DB_CHECK",
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "DB_CHECK | ERRO INESPERADO | "
-            "stage=%s | error_type=%s | message=%s",
-            stage,
-            type(e).__name__,
-            str(e),
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "stage": stage,
-                "status": "failed",
-                "category": "internal_error",
-                "error_type": type(e).__name__,
-            },
-        )
-
-    finally:
-
-        close_resources(conn, cursor)
-
-
-# ==========================================
-# ETAPA 3 - CONSULTA REAL NA SB1G10
-# ==========================================
-
-@app.get(
-    "/v1/test",
-    dependencies=[Depends(require_api_token)],
-)
-def test_sku(
-    sku: str = Query(
-        ...,
-        min_length=1,
-        description="Código do produto (B1_COD)",
-    )
+def get_invoices(
+    nf: Optional[int] = Query(default=None),
+    cnpj: Optional[str] = Query(default=None),
+    dataInicio: Optional[date] = Query(default=None),
+    dataFim: Optional[date] = Query(default=None),
+    limit: Optional[int] = Query(default=None, gt=0, le=5000),
 ):
 
     conn = None
     cursor = None
 
-    stage = "initialization"
-    start = time.monotonic()
-
-    sku = sku.strip()
-
-    logger.info(
-        "SB1_TEST | Início | sku=%r",
-        sku,
-    )
-
     try:
 
-        # 1. Abrir conexão
-        stage = "connection"
-
-        conn = get_connection()
-
-        # 2. Preparar consulta
-        stage = "query_execution"
-
-        query = """
-            SELECT TOP 1 *
-            FROM SB1G10
-            WHERE
-                TRIM(B1_COD) = ?
-                OR TRY_CONVERT(
-                    BIGINT,
-                    TRIM(B1_COD)
-                ) = TRY_CONVERT(
-                    BIGINT,
-                    ?
-                )
-        """
-
-        logger.info(
-            "SB1_TEST | Executando consulta | "
-            "table=SB1G10 | sku=%r",
-            sku,
-        )
-
-        query_start = time.monotonic()
-
-        cursor = conn.cursor()
-
-        # Parâmetros posicionais do pyodbc.
-        # Evita concatenar o SKU diretamente no SQL.
-        cursor.execute(
-            query,
-            sku,
-            sku,
-        )
-
-        # 3. Processar resultado
-        stage = "result_processing"
-
-        result = cursor.fetchone()
-
-        query_elapsed = time.monotonic() - query_start
-
-        if result is None:
-
-            total_elapsed = time.monotonic() - start
-
-            logger.warning(
-                "SB1_TEST | SKU não encontrado | "
-                "sku=%r | query_elapsed=%.3fs",
-                sku,
-                query_elapsed,
+        if dataInicio and dataFim and dataInicio > dataFim:
+            raise HTTPException(
+                status_code=400,
+                detail="dataInicio não pode ser maior que dataFim",
             )
 
-            return {
-                "stage": "sb1_test",
-                "status": "success",
-                "sku": sku,
-                "found": False,
-                "message": "Nenhum produto encontrado",
-                "query_elapsed_seconds": round(
-                    query_elapsed, 3
-                ),
-                "total_elapsed_seconds": round(
-                    total_elapsed, 3
-                ),
-            }
+        normalized_cnpj = None
 
-        columns = [
-            column[0]
-            for column in cursor.description
-        ]
+        if cnpj:
+            normalized_cnpj = normalize_cnpj(cnpj)
 
-        record = dict(
-            zip(columns, result)
-        )
+            if not normalized_cnpj:
+                raise HTTPException(
+                    status_code=400,
+                    detail="CNPJ inválido",
+                )
 
-        record = jsonable_encoder(record)
+        conn = get_connection()
+        cursor = conn.cursor()
 
-        total_elapsed = time.monotonic() - start
+        query = """
+            SELECT
+        """
 
-        logger.info(
-            "SB1_TEST | SUCESSO | "
-            "sku=%r | columns=%s | "
-            "query_elapsed=%.3fs | total_elapsed=%.3fs",
-            sku,
-            len(columns),
-            query_elapsed,
-            total_elapsed,
+        params = []
+
+        if limit:
+            query += " TOP (?) "
+            params.append(limit)
+
+        query += """
+                *
+            FROM VIEW_PROTHEUS_GERENCIAL_VENDAS
+            WHERE FILIAL = 'POLAR'
+        """
+
+        # ----------------------------------------------------
+        # FILTRO: NOTA FISCAL
+        # ----------------------------------------------------
+
+        if nf is not None:
+
+            query += """
+                AND TRY_CONVERT(BIGINT, NotaFiscal) = ?
+            """
+
+            params.append(nf)
+
+        # ----------------------------------------------------
+        # FILTRO: CNPJ
+        # ----------------------------------------------------
+
+        if normalized_cnpj:
+
+            query += """
+                AND REPLACE(
+                    REPLACE(
+                        REPLACE(
+                            CPF_CNPJ,
+                            '-',
+                            ''
+                        ),
+                        '.',
+                        ''
+                    ),
+                    ' ',
+                    ''
+                ) = ?
+            """
+
+            params.append(normalized_cnpj)
+
+        # ----------------------------------------------------
+        # FILTRO: DATA INICIAL
+        # ----------------------------------------------------
+
+        if dataInicio:
+
+            query += """
+                AND DataEmissao >= ?
+            """
+
+            params.append(dataInicio)
+
+        # ----------------------------------------------------
+        # FILTRO: DATA FINAL
+        # ----------------------------------------------------
+
+        if dataFim:
+
+            query += """
+                AND DataEmissao < DATEADD(DAY, 1, ?)
+            """
+
+            params.append(dataFim)
+
+        # ----------------------------------------------------
+        # ORDENAÇÃO
+        # ----------------------------------------------------
+
+        query += """
+            ORDER BY
+                DataEmissao DESC,
+                NotaFiscal DESC,
+                N_Item ASC
+        """
+
+        cursor.execute(query, params)
+
+        rows = cursor.fetchall()
+
+        data = rows_to_dict(
+            cursor,
+            rows,
         )
 
         return {
-            "stage": "sb1_test",
-            "status": "success",
-            "sku": sku,
-            "found": True,
-            "query_elapsed_seconds": round(
-                query_elapsed, 3
-            ),
-            "total_elapsed_seconds": round(
-                total_elapsed, 3
-            ),
-            "data": record,
+            "success": True,
+            "total": len(data),
+            "items": serialize_data(data),
         }
 
     except HTTPException:
         raise
 
-    except pyodbc.Error as e:
-
-        raise_odbc_http_error(
-            stage,
-            e,
-            "SB1_TEST",
-        )
-
-    except Exception as e:
+    except Exception:
 
         logger.exception(
-            "SB1_TEST | ERRO INESPERADO | "
-            "stage=%s | sku=%r | "
-            "error_type=%s | message=%s",
-            stage,
-            sku,
-            type(e).__name__,
-            str(e),
+            "INVOICE | Erro ao consultar notas fiscais"
         )
 
         raise HTTPException(
             status_code=500,
-            detail={
-                "stage": stage,
-                "status": "failed",
-                "category": "internal_error",
-                "error_type": type(e).__name__,
-            },
+            detail="Erro interno ao consultar notas fiscais",
         )
 
     finally:
 
-        close_resources(conn, cursor)
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# PRODUCTS
+#
+# GET /products?sku=2430
+#
+# GET /products?sku=2430&qtd=20
+#
+# GET /products?items=[{"sku":"2430","qtd":20}]
+# ============================================================
+
+def fetch_product_structures(skus: list[str]):
+
+    normalized_skus = list(
+        dict.fromkeys(
+            normalize_sku(sku)
+            for sku in skus
+            if sku and normalize_sku(sku)
+        )
+    )
+
+    if not normalized_skus:
+        return []
+
+    conn = None
+    cursor = None
+
+    try:
+
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        conditions = []
+        params = []
+
+        for sku in normalized_skus:
+
+            conditions.append(
+                """
+                (
+                    TRIM(PRODUTO.B1_COD) = ?
+
+                    OR
+
+                    TRY_CONVERT(
+                        BIGINT,
+                        TRIM(PRODUTO.B1_COD)
+                    ) = TRY_CONVERT(BIGINT, ?)
+                )
+                """
+            )
+
+            params.extend([
+                sku,
+                sku,
+            ])
+
+        sku_conditions = " OR ".join(conditions)
+
+        query = f"""
+            SELECT
+
+                PRODUTO.B1_COD,
+                PRODUTO.B1_DESC,
+                PRODUTO.B1_PESO,
+
+                ESTRUTURA.G1_COMP,
+                COMPONENTE.B1_DESC AS B1_DESC_EMBALAGEM,
+                ESTRUTURA.G1_QUANT,
+
+                EMBALAGEM.B5_LARG,
+                EMBALAGEM.B5_COMPR,
+                EMBALAGEM.B5_ESPESS
+
+            FROM SB1G10 AS PRODUTO
+
+            INNER JOIN SG1G10 AS ESTRUTURA
+                ON TRIM(ESTRUTURA.G1_COD) =
+                   TRIM(PRODUTO.B1_COD)
+
+            INNER JOIN SB1G10 AS COMPONENTE
+                ON TRIM(COMPONENTE.B1_COD) =
+                   TRIM(ESTRUTURA.G1_COMP)
+
+            LEFT JOIN SB5G10 AS EMBALAGEM
+                ON TRIM(EMBALAGEM.B5_COD) =
+                   TRIM(ESTRUTURA.G1_COMP)
+
+            WHERE
+
+                (
+                    {sku_conditions}
+                )
+
+                AND TRIM(
+                    ISNULL(ESTRUTURA.D_E_L_E_T_, '')
+                ) <> '*'
+
+                AND TRIM(COMPONENTE.B1_TIPO) = 'EM'
+
+                AND TRIM(COMPONENTE.B1_COD) NOT IN (
+                    '000054',
+                    '000055',
+                    '000057',
+                    '000163',
+                    '000384',
+                    '000389',
+                    '000735',
+                    '000927',
+                    '000995',
+                    '001499',
+                    '001571',
+                    '001640',
+                    '002374',
+                    '002710',
+                    '002711',
+                    '002712',
+                    '002756',
+                    '002757',
+                    '002758',
+                    '002813',
+                    '000205'
+                )
+
+            ORDER BY
+                PRODUTO.B1_COD
+        """
+
+        cursor.execute(query, params)
+
+        rows = cursor.fetchall()
+
+        return rows_to_dict(
+            cursor,
+            rows,
+        )
+
+    finally:
+
+        if cursor:
+            cursor.close()
+
+        if conn:
+            conn.close()
+
+
+def find_product_rows(
+    sku: str,
+    product_rows: list[dict],
+):
+    """
+    Localiza as linhas da estrutura de um SKU.
+    Primeiro tenta o código exato.
+    Depois compara o valor numérico, permitindo
+    equivalência entre 2430 e 002430.
+    """
+
+    normalized_sku = normalize_sku(sku)
+
+    exact = [
+        row
+        for row in product_rows
+        if normalize_sku(row.get("B1_COD", "")) == normalized_sku
+    ]
+
+    if exact:
+        return exact
+
+    numeric_sku = find_numeric_sku(normalized_sku)
+
+    if numeric_sku is None:
+        return []
+
+    return [
+        row
+        for row in product_rows
+        if find_numeric_sku(
+            normalize_sku(row.get("B1_COD", ""))
+        ) == numeric_sku
+    ]
+
+
+# ============================================================
+# PRODUCTS ROUTE
+# ============================================================
+
+@app.get(
+    "/products",
+    dependencies=[Depends(require_api_token)],
+)
+def get_products(
+    sku: Optional[str] = Query(default=None),
+    qtd: Optional[float] = Query(default=None, gt=0),
+    items: Optional[str] = Query(default=None),
+):
+
+    try:
+
+        # ====================================================
+        # MODO 1: LISTA DE PRODUTOS
+        #
+        # ?items=[
+        #   {"sku":"2430","qtd":20},
+        #   {"sku":"1000","qtd":50}
+        # ]
+        # ====================================================
+
+        if items is not None:
+
+            try:
+                parsed_items = json.loads(items)
+            except json.JSONDecodeError:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Parâmetro items inválido. Envie um JSON válido.",
+                )
+
+            if not isinstance(parsed_items, list):
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="O parâmetro items deve ser uma lista.",
+                )
+
+            if not parsed_items:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="A lista de produtos não pode estar vazia.",
+                )
+
+            normalized_items = []
+
+            for index, item in enumerate(parsed_items):
+
+                if not isinstance(item, dict):
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Item {index + 1} inválido.",
+                    )
+
+                item_sku = normalize_sku(
+                    item.get("sku", "")
+                )
+
+                if not item_sku:
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"SKU não informado no item {index + 1}.",
+                    )
+
+                try:
+                    quantidade = float(item.get("qtd"))
+                except (TypeError, ValueError):
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Quantidade inválida para o SKU {item_sku}.",
+                    )
+
+                if quantidade <= 0:
+
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Quantidade inválida para o SKU {item_sku}.",
+                    )
+
+                normalized_items.append({
+                    "sku": item_sku,
+                    "qtd": quantidade,
+                })
+
+            skus = [
+                item["sku"]
+                for item in normalized_items
+            ]
+
+            product_rows = fetch_product_structures(skus)
+
+            results = []
+
+            for item in normalized_items:
+
+                product_data = find_product_rows(
+                    item["sku"],
+                    product_rows,
+                )
+
+                if not product_data:
+
+                    results.append({
+                        "sku": item["sku"],
+                        "qtd": item["qtd"],
+                        "success": False,
+                        "message": "Produto ou embalagem não encontrada",
+                    })
+
+                    continue
+
+                results.append({
+                    "sku": item["sku"],
+                    "qtd": item["qtd"],
+                    "success": True,
+                    "data": product_data,
+                })
+
+            not_found = [
+                item["sku"]
+                for item in results
+                if not item["success"]
+            ]
+
+            return {
+                "success": True,
+                "data": {
+                    "items": serialize_data(results),
+                    "produtosNaoEncontrados": not_found,
+                },
+            }
+
+        # ====================================================
+        # MODO 2: SKU ÚNICO
+        #
+        # ?sku=2430
+        # ?sku=2430&qtd=20
+        # ====================================================
+
+        if not sku or not sku.strip():
+
+            raise HTTPException(
+                status_code=400,
+                detail="SKU não informado",
+            )
+
+        normalized_sku = normalize_sku(sku)
+
+        product_rows = fetch_product_structures([
+            normalized_sku
+        ])
+
+        product_data = find_product_rows(
+            normalized_sku,
+            product_rows,
+        )
+
+        if not product_data:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Produto ou embalagem não encontrada",
+            )
+
+        return {
+            "success": True,
+            "data": {
+                "sku": normalized_sku,
+                "qtd": qtd,
+                "structure": serialize_data(product_data),
+            },
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception:
+
+        logger.exception(
+            "PRODUCTS | Erro ao consultar produtos"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Erro interno ao consultar produtos",
+        )
