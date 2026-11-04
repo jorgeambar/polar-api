@@ -1,4 +1,3 @@
-
 import os
 import hmac
 import logging
@@ -11,7 +10,7 @@ from typing import Annotated
 import pyodbc
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Header, HTTPException
+from fastapi import FastAPI, Depends, Header, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 
 
@@ -39,8 +38,8 @@ logger = logging.getLogger("polar-api")
 
 app = FastAPI(
     title="Polar API",
-    version="0.3.0",
-    description="Diagnóstico de conectividade com SQL Server",
+    version="0.4.0",
+    description="Diagnóstico e consulta SQL Server",
 )
 
 
@@ -55,7 +54,6 @@ def require_api_token(
 
     if not expected:
         logger.error("AUTH | POLAR_API_TOKEN não configurado")
-
         raise HTTPException(
             status_code=503,
             detail="API token not configured",
@@ -68,7 +66,6 @@ def require_api_token(
         or not hmac.compare_digest(token, expected)
     ):
         logger.warning("AUTH | Falha de autenticação")
-
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
@@ -83,8 +80,9 @@ def get_sql_config():
 
     required_vars = [
         "SQL_SERVER",
+        "SQL_PORT",
         "SQL_DATABASE",
-        "SQL_USERNAME",
+        "SQL_USER",
         "SQL_PASSWORD",
     ]
 
@@ -100,18 +98,19 @@ def get_sql_config():
 
     return {
         "server": os.environ["SQL_SERVER"].strip(),
+        "port": int(os.environ["SQL_PORT"]),
         "database": os.environ["SQL_DATABASE"].strip(),
-        "username": os.environ["SQL_USERNAME"],
+        "username": os.environ["SQL_USER"],
         "password": os.environ["SQL_PASSWORD"],
         "driver": os.getenv(
             "SQL_DRIVER",
             "ODBC Driver 18 for SQL Server",
         ),
-        "encrypt": os.getenv("SQL_ENCRYPT", "yes"),
+        "encrypt": os.getenv("SQL_ENCRYPT", "no").lower(),
         "trust_certificate": os.getenv(
             "SQL_TRUST_SERVER_CERTIFICATE",
-            "no",
-        ),
+            "yes",
+        ).lower(),
         "connection_timeout": int(
             os.getenv("SQL_CONNECTION_TIMEOUT", "15")
         ),
@@ -136,9 +135,13 @@ def odbc_value(value: str) -> str:
 
 def build_connection_string(config):
 
+    server = (
+        f"tcp:{config['server']},{config['port']}"
+    )
+
     return (
         f"DRIVER={odbc_value(config['driver'])};"
-        f"SERVER={odbc_value(config['server'])};"
+        f"SERVER={server};"
         f"DATABASE={odbc_value(config['database'])};"
         f"UID={odbc_value(config['username'])};"
         f"PWD={odbc_value(config['password'])};"
@@ -168,7 +171,7 @@ def get_odbc_error_details(error):
         else str(error)
     )
 
-    # Oculta possíveis credenciais presentes na mensagem.
+    # Evita registrar credenciais em mensagens ODBC.
     error_message = re.sub(
         r"(?i)(PWD|PASSWORD)\s*=\s*[^;}\s]+",
         r"\1=***",
@@ -209,11 +212,7 @@ def classify_odbc_error(details):
     if sqlstate in ["HYT00", "HYT01"]:
         return "connection_or_query_timeout"
 
-    if sqlstate in [
-        "08001",
-        "08004",
-        "08S01",
-    ]:
+    if sqlstate in ["08001", "08004", "08S01"]:
         return "network_or_connection_error"
 
     if any(term in message for term in [
@@ -246,6 +245,26 @@ def log_odbc_error(prefix, stage, error):
     return details, category
 
 
+def raise_odbc_http_error(stage, error, prefix):
+
+    details, category = log_odbc_error(
+        prefix,
+        stage,
+        error,
+    )
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "stage": stage,
+            "status": "failed",
+            "category": category,
+            "sqlstate": details["sqlstate"],
+            "native_codes": details["native_codes"],
+        },
+    )
+
+
 # ==========================================
 # CONEXÃO SQL SERVER
 # ==========================================
@@ -258,10 +277,11 @@ def get_connection():
 
     logger.info(
         "CONNECT | Iniciando conexão | "
-        "server=%s | database=%s | driver=%s | "
-        "encrypt=%s | trust_certificate=%s | "
-        "timeout=%ss",
+        "server=%s | port=%s | database=%s | "
+        "driver=%s | encrypt=%s | "
+        "trust_certificate=%s | timeout=%ss",
         config["server"],
+        config["port"],
         config["database"],
         config["driver"],
         config["encrypt"],
@@ -276,14 +296,14 @@ def get_connection():
             timeout=config["connection_timeout"],
         )
 
-        # Timeout de execução das consultas.
-        # É configurado na conexão, não no cursor.
+        # Equivalente ao timeout de execução de consultas.
+        # Não configurar timeout no cursor.
         conn.timeout = config["query_timeout"]
 
         elapsed = time.monotonic() - start
 
         logger.info(
-            "CONNECT | SUCESSO | elapsed=%.2fs",
+            "CONNECT | SUCESSO | elapsed=%.3fs",
             elapsed,
         )
 
@@ -292,15 +312,13 @@ def get_connection():
     except pyodbc.Error as e:
 
         elapsed = time.monotonic() - start
-
         details = get_odbc_error_details(e)
         category = classify_odbc_error(details)
 
         logger.error(
-            "CONNECT | FALHA | "
-            "elapsed=%.2fs | category=%s | "
-            "sqlstate=%s | native_codes=%s | "
-            "message=%s",
+            "CONNECT | FALHA | elapsed=%.3fs | "
+            "category=%s | sqlstate=%s | "
+            "native_codes=%s | message=%s",
             elapsed,
             category,
             details["sqlstate"],
@@ -340,30 +358,6 @@ def close_resources(conn=None, cursor=None):
 
 
 # ==========================================
-# RESPOSTA PADRÃO PARA ERRO ODBC
-# ==========================================
-
-def raise_odbc_http_error(stage, error, prefix):
-
-    details, category = log_odbc_error(
-        prefix,
-        stage,
-        error,
-    )
-
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "stage": stage,
-            "status": "failed",
-            "category": category,
-            "sqlstate": details["sqlstate"],
-            "native_codes": details["native_codes"],
-        },
-    )
-
-
-# ==========================================
 # ROTAS PÚBLICAS
 # ==========================================
 
@@ -372,7 +366,7 @@ def root():
 
     return {
         "service": "Polar API",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "status": "ok",
     }
 
@@ -402,18 +396,8 @@ def tcp_check():
 
         config = get_sql_config()
 
-        server = re.sub(
-            r"(?i)^tcp:",
-            "",
-            config["server"],
-        )
-
-        if "," in server:
-            host, port = server.rsplit(",", 1)
-            port = int(port)
-        else:
-            host = server
-            port = 1433
+        host = config["server"]
+        port = config["port"]
 
         stage = "tcp_connection"
 
@@ -427,6 +411,7 @@ def tcp_check():
             (host, port),
             timeout=10,
         ):
+
             elapsed = time.monotonic() - start
 
             logger.info(
@@ -445,7 +430,8 @@ def tcp_check():
     except Exception as e:
 
         logger.exception(
-            "TCP | FALHA | stage=%s | error_type=%s | message=%s",
+            "TCP | FALHA | stage=%s | "
+            "error_type=%s | message=%s",
             stage,
             type(e).__name__,
             str(e),
@@ -463,7 +449,7 @@ def tcp_check():
 
 
 # ==========================================
-# ETAPA 2 - CONEXÃO E CONSULTA SIMPLES
+# ETAPA 2 - CONEXÃO SQL + SELECT 1
 # ==========================================
 
 @app.get(
@@ -482,7 +468,7 @@ def db_check():
 
     try:
 
-        # ETAPA 1: verificar driver
+        # 1. Verificar driver
         stage = "driver_check"
 
         drivers = pyodbc.drivers()
@@ -494,11 +480,6 @@ def db_check():
         )
 
         if config["driver"] not in drivers:
-
-            logger.error(
-                "DB_CHECK | Driver não encontrado | requested=%s",
-                config["driver"],
-            )
 
             raise HTTPException(
                 status_code=503,
@@ -516,12 +497,12 @@ def db_check():
             config["driver"],
         )
 
-        # ETAPA 2: conexão
+        # 2. Conectar ao SQL Server
         stage = "connection"
 
         conn = get_connection()
 
-        # ETAPA 3: SELECT 1
+        # 3. Executar consulta simples
         stage = "query_execution"
 
         logger.info(
@@ -570,22 +551,6 @@ def db_check():
     except HTTPException:
         raise
 
-    except RuntimeError:
-
-        logger.exception(
-            "DB_CHECK | ERRO DE CONFIGURAÇÃO OU EXECUÇÃO | stage=%s",
-            stage,
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "stage": stage,
-                "status": "failed",
-                "category": "configuration_or_query_error",
-            },
-        )
-
     except pyodbc.Error as e:
 
         raise_odbc_http_error(
@@ -620,14 +585,20 @@ def db_check():
 
 
 # ==========================================
-# ETAPA 3 - TESTE REAL DA VIEW
+# ETAPA 3 - CONSULTA REAL NA SB1G10
 # ==========================================
 
 @app.get(
     "/v1/test",
     dependencies=[Depends(require_api_token)],
 )
-def test_invoice():
+def test_sku(
+    sku: str = Query(
+        ...,
+        min_length=1,
+        description="Código do produto (B1_COD)",
+    )
+):
 
     conn = None
     cursor = None
@@ -635,43 +606,56 @@ def test_invoice():
     stage = "initialization"
     start = time.monotonic()
 
-    logger.info("TEST | Início da consulta real")
+    sku = sku.strip()
+
+    logger.info(
+        "SB1_TEST | Início | sku=%r",
+        sku,
+    )
 
     try:
 
-        # ETAPA 1: conexão
+        # 1. Abrir conexão
         stage = "connection"
-
-        logger.info("TEST | Abrindo conexão")
 
         conn = get_connection()
 
-        # ETAPA 2: consulta
+        # 2. Preparar consulta
         stage = "query_execution"
 
         query = """
             SELECT TOP 1 *
-            FROM VIEW_PROTHEUS_GERENCIAL_VENDAS
-            WHERE FILIAL = 'POLAR'
-            ORDER BY
-                DataEmissao DESC,
-                NotaFiscal DESC,
-                N_Item ASC
+            FROM SB1G10
+            WHERE
+                TRIM(B1_COD) = ?
+                OR TRY_CONVERT(
+                    BIGINT,
+                    TRIM(B1_COD)
+                ) = TRY_CONVERT(
+                    BIGINT,
+                    ?
+                )
         """
 
         logger.info(
-            "TEST | Executando consulta | "
-            "view=VIEW_PROTHEUS_GERENCIAL_VENDAS | "
-            "filial=POLAR"
+            "SB1_TEST | Executando consulta | "
+            "table=SB1G10 | sku=%r",
+            sku,
         )
 
         query_start = time.monotonic()
 
         cursor = conn.cursor()
 
-        cursor.execute(query)
+        # Parâmetros posicionais do pyodbc.
+        # Evita concatenar o SKU diretamente no SQL.
+        cursor.execute(
+            query,
+            sku,
+            sku,
+        )
 
-        # ETAPA 3: resultado
+        # 3. Processar resultado
         stage = "result_processing"
 
         result = cursor.fetchone()
@@ -680,17 +664,26 @@ def test_invoice():
 
         if result is None:
 
+            total_elapsed = time.monotonic() - start
+
             logger.warning(
-                "TEST | Consulta executada sem resultados"
+                "SB1_TEST | SKU não encontrado | "
+                "sku=%r | query_elapsed=%.3fs",
+                sku,
+                query_elapsed,
             )
 
             return {
-                "stage": "test",
+                "stage": "sb1_test",
                 "status": "success",
-                "view": "VIEW_PROTHEUS_GERENCIAL_VENDAS",
-                "records_found": 0,
-                "message": (
-                    "Nenhum registro encontrado para FILIAL = POLAR"
+                "sku": sku,
+                "found": False,
+                "message": "Nenhum produto encontrado",
+                "query_elapsed_seconds": round(
+                    query_elapsed, 3
+                ),
+                "total_elapsed_seconds": round(
+                    total_elapsed, 3
                 ),
             }
 
@@ -699,66 +692,57 @@ def test_invoice():
             for column in cursor.description
         ]
 
-        first_record = dict(
+        record = dict(
             zip(columns, result)
         )
 
-        first_record = jsonable_encoder(first_record)
+        record = jsonable_encoder(record)
 
         total_elapsed = time.monotonic() - start
 
         logger.info(
-            "TEST | SUCESSO | "
-            "columns=%s | query_elapsed=%.3fs | "
-            "total_elapsed=%.3fs",
+            "SB1_TEST | SUCESSO | "
+            "sku=%r | columns=%s | "
+            "query_elapsed=%.3fs | total_elapsed=%.3fs",
+            sku,
             len(columns),
             query_elapsed,
             total_elapsed,
         )
 
         return {
-            "stage": "test",
+            "stage": "sb1_test",
             "status": "success",
-            "view": "VIEW_PROTHEUS_GERENCIAL_VENDAS",
-            "records_found": 1,
-            "query_elapsed_seconds": round(query_elapsed, 3),
-            "total_elapsed_seconds": round(total_elapsed, 3),
-            "data": first_record,
+            "sku": sku,
+            "found": True,
+            "query_elapsed_seconds": round(
+                query_elapsed, 3
+            ),
+            "total_elapsed_seconds": round(
+                total_elapsed, 3
+            ),
+            "data": record,
         }
 
     except HTTPException:
         raise
-
-    except RuntimeError:
-
-        logger.exception(
-            "TEST | ERRO DE CONFIGURAÇÃO | stage=%s",
-            stage,
-        )
-
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "stage": stage,
-                "status": "failed",
-                "category": "configuration_error",
-            },
-        )
 
     except pyodbc.Error as e:
 
         raise_odbc_http_error(
             stage,
             e,
-            "TEST",
+            "SB1_TEST",
         )
 
     except Exception as e:
 
         logger.exception(
-            "TEST | ERRO INESPERADO | "
-            "stage=%s | error_type=%s | message=%s",
+            "SB1_TEST | ERRO INESPERADO | "
+            "stage=%s | sku=%r | "
+            "error_type=%s | message=%s",
             stage,
+            sku,
             type(e).__name__,
             str(e),
         )
