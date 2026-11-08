@@ -1104,6 +1104,49 @@ def get_customer_invoices(
         )
 
 
+
+# ============================================================
+# ROTA: ESTRUTURAS COMPLETAS DE PRODUTOS
+# ============================================================
+
+@app.get(
+    "/v1/product-structures",
+    dependencies=[Depends(require_api_token)],
+)
+def get_product_structures(
+    skus: list[str] = Query(...),
+):
+    if not skus or len(skus) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe entre 1 e 100 SKUs.",
+        )
+
+    try:
+        products_raw = find_product_structures(skus)
+
+        products = [
+            map_product_structure(product)
+            for product in products_raw
+        ]
+
+        return {
+            "success": True,
+            "total": len(products),
+            "data": products,
+        }
+
+    except Exception as error:
+        logger.exception(
+            "Erro ao consultar estruturas completas de produtos."
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Erro ao consultar estruturas de produtos.",
+        )
+
+
 # ============================================================
 # HEALTH CHECK
 # ============================================================
